@@ -1,0 +1,24 @@
+# ===== 密钥与隐私，绝对不能上传 =====
+# 注意：gitignore 不支持行内注释，注释必须独立成行
+
+# API Key 在里面，泄露 = 被人刷爆你的账户
+.env
+
+# 你和 AI 的真实对话记录
+chat_history.json
+
+# 个人学习日志
+学习进度.md
+
+# ===== Python 运行产物 =====
+.venv/
+__pycache__/
+*.pyc
+
+# ===== IDE =====
+.vscode/
+.idea/
+
+# ===== 系统杂项 =====
+.DS_Store
+Thumbs.db
