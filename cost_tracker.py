@@ -162,15 +162,18 @@ class CostMeter:
         self.hit_tokens = 0
         self.completion_tokens = 0
         self.total_cost = 0.0
+        # 批量并发时多个线程会同时记账，必须加锁，否则累加会丢数据
+        self._lock = __import__("threading").Lock()
 
     def add(self, usage, peak=None):
         pt, hit, ct = read_usage(usage)
         cost, _ = calc_cost(pt, hit, ct, self.model, peak)
-        self.calls += 1
-        self.prompt_tokens += pt
-        self.hit_tokens += hit
-        self.completion_tokens += ct
-        self.total_cost += cost
+        with self._lock:
+            self.calls += 1
+            self.prompt_tokens += pt
+            self.hit_tokens += hit
+            self.completion_tokens += ct
+            self.total_cost += cost
         return cost
 
     def report(self, daily_calls=None):

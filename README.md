@@ -1,9 +1,18 @@
-# cli-ai-chatbot · 命令行 AI 聊天机器人
+# ai-dev · AI 应用开发作品集
+
+作者「16 周 AI 应用开发学习路线」的工程实践仓库。目前包含两个可运行模块，都是纯 Python 实现，不依赖 LangChain 等框架——目的是先把底层机制手写一遍。
+
+| 模块 | 说明 | 关键点 |
+|---|---|---|
+| **cli-chatbot** | 命令行流式多轮对话工具 | 错误重试、token 成本核算、上下文裁剪 |
+| **resume-extractor** | 简历信息抽取器（自然语言 → 结构化 JSON） | 嵌套 schema、四层校验、批量评测 |
+
+---
+
+# 模块一：cli-chatbot
 
 基于 DeepSeek API 的命令行流式多轮对话工具，内置**错误重试、token 成本核算与上下文管理**。
 纯 Python 标准库 + OpenAI 兼容 SDK，无其他框架依赖。
-
-> 这是作者「16 周 AI 应用开发学习路线」第 2 周的综合作品，定位是后续 RAG / Agent 项目的工程地基。
 
 ## 功能
 
@@ -18,7 +27,7 @@
 
 ```bash
 # 1. 克隆并安装依赖
-git clone https://github.com/<你的用户名>/cli-ai-chatbot.git
+git clone https://github.com/itxiong184/cli-ai-chatbot.git
 cd cli-ai-chatbot
 python -m venv .venv
 .venv\Scripts\activate        # Windows；macOS/Linux 用 source .venv/bin/activate
@@ -65,15 +74,120 @@ API Key 在 [DeepSeek 开放平台](https://platform.deepseek.com) 申请，充�
 | 首字响应 | 约 1 秒 |
 | 上下文窗口 | 保留最近 8 轮 + system |
 
+---
+
+# 模块二：resume-extractor
+
+把一段自由文本（简历片段、口语化自我介绍、招聘启事）抽取成固定结构的 JSON，供入库、筛选、打分等下游程序使用。
+
+## 为什么需要它
+
+聊天模式的输出给人看，抽取模式的输出给程序用。`"郑州轻工业大学，本科，会 Python"` 没法做筛选；`{"school": "...", "degree": "本科", "skills": ["Python"]}` 可以直接进数据库。
+
+## 数据契约（schema v2.0）
+
+```json
+{
+  "name": "string|null",
+  "phone": "string|null",
+  "email": "string|null",
+  "city": "string|null",
+  "education": [
+    {"school": "string", "major": "string|null",
+     "degree": "专科|本科|硕士|博士|null", "graduation_year": "string|null"}
+  ],
+  "skills": ["string"],
+  "years_experience": "number|null",
+  "projects": [{"name": "string", "tech": ["string"], "summary": "string|null"}]
+}
+```
+
+`education` 和 `projects` 是**对象数组**：一个人可能有三段学历、四个项目，扁平结构只能存一个，其余信息在抽取阶段就永久丢失了。
+
+## 四层校验
+
+| 层 | 检查什么 | 能挡住什么 |
+|---|---|---|
+| 结构 | 字段是否齐全、类型是否正确 | 模型改字段名、漏字段 |
+| 格式 | 手机号 11 位、年份 4 位、学历在枚举内 | 脏值污染下游 |
+| 依据 | 抽出的值能否在原文找到 | 编造（幻觉） |
+| **归属** | 值所在句子里，它前面有没有"联系人/家属/推荐人" | 张冠李戴（HR 的电话安到候选人头上） |
+
+第三层挡不住第四层的问题：HR 的号码**确实在原文里**，回溯校验必然通过，但号码不属于候选人。这类错误叫归属错误，必须单独检测。
+
+校验不通过时，把问题清单回灌给模型让它自己改一次（self-repair）。
+
+## 快速开始
+
+```bash
+python extractor.py --dry              # 只看将要发送的 prompt，不花钱
+python extractor.py                    # 跑内置 4 个样本
+python extractor.py --file 我的简历.txt  # 抽你自己的
+python test_extractor.py               # 校验器单元测试（10 项，不联网）
+
+python batch_extract.py                # 批量抽取（并发 6 + 断点续跑）
+python eval_resume.py                  # 打分：字段级 / 条目级 / 完全正确率
+```
+
+## 评测结果（40 条人工标注，schema v2.0）
+
+| 指标 | 数值 |
+|---|---|
+| 完全正确率 | **92.5%**（37/40，8 个字段全对才算对） |
+| 字段平均准确率（macro） | 98.4% |
+| 学历条目 P / R / F1 | 97.5% / 97.5% / 97.5%（子字段 160/160） |
+| 项目条目 P / R / F1 | 100% / 100% / 100% |
+| 批量吞吐 | 40 条 / 7.4 秒（并发 6，约 0.19 s/条） |
+| 单条成本 | 约 0.63 厘（含 42 次调用 / 40 条样本，多出的是自修复） |
+
+剩余错误的根因分析，以及"哪部分是模型错、哪部分是我标注错"的归类，见 `eval/report_v2.md`。
+
+## 迭代记录：同一份数据，宏观准确率 94.7% → 98.4%
+
+第一轮跑完发现两个问题，都不是"模型不行"：
+
+1. **我自己写的归属检测误报**，把 r10 / r32 两条正确的手机号判成干扰，自修复又把它改成了 `null`——校验器的误报会主动污染数据，比漏检更危险。修法：窗口从"前后 25 字"收窄到"同一句内、且词在值之前"。修复后这两条立刻恢复，`phone` 字段回到 100%。
+2. **`skills` 的定义没写清**：项目里提到的技术算不算技能？没说，于是模型抽了、我标的是空。把规则写明（全文技术关键词，允许与 `projects[].tech` 重复）并重标 10 条后，`skills` 从 75% 升到 95%。
+
+同时补了 `test_extractor.py`：`validate()` 是纯函数，用单元测试钉住行为；只有模型那部分才需要评测集。
+
+---
+
+## 踩坑记录
+
+**1. `.gitignore` 不支持行内注释**
+写了 `.env   # API Key 在里面`，git 把整行当成文件名，规则静默失效，`.env` 差点被推上公开仓库。注释必须独立成行，且 `git add` 之后一定要看 `git status`。
+
+**2. 流式响应的末帧 `choices` 是空列表**
+带 usage 的那一帧没有内容，习惯性写 `chunk.choices[0]` 会 `IndexError`，而且崩在输出完成之后，看起来像"答完了但程序报错"。顺序必须是：先取 usage，再判空。
+
+**3. `"2027" in text` 这种检查会骗人**
+邮箱 `liming2027@163.com` 里也有 `2027`。年份校验必须用词边界 `(?<![0-9A-Za-z])2027(?![0-9A-Za-z])`。
+
+**4. 校验器的误报会通过 self-repair 污染数据**
+把"没有依据的字段必须为 null"写进修复提示，等于给模型一个清空字段的许可。检测器一旦误报，正确的数据就被改成 null。修复提示要交回判断权："确实错的才改，原文写明的要保留"。
+
+---
+
 ## 项目结构
 
 ```
-cli-ai-chatbot/
-├── chatbot.py        # 主程序：多轮 + 流式 + 记账 + 存档 + 命令处理
-├── cost_tracker.py   # 成本核算模块：价目表、时段判断、用量解析、账本
-├── robust_call.py    # 重试模块：错误三分类、指数退避 + 抖动
-├── .env.example      # 环境变量模板
-└── practice/         # 学习过程中的练习脚本（字符串/文件IO/裸HTTP/流式等）
+ai_dev/
+├── chatbot.py             # 模块一主程序：多轮 + 流式 + 记账 + 存档
+├── cost_tracker.py        # 成本核算：价目表、时段、用量解析、账本
+├── robust_call.py         # 重试：错误三分类、指数退避 + 抖动
+├── extractor.py           # 模块二：schema + 四层校验 + 自修复
+├── batch_extract.py       # 批量：并发 + 断点续跑 + 失败隔离
+├── eval_resume.py         # 评测：标量 / 集合 / 对象数组三种比对
+├── test_extractor.py      # 校验器单元测试（10 项，离线）
+├── eval/
+│   ├── samples_v2.jsonl   # 40 条人工标注（含多段学历、多项目、干扰实体）
+│   ├── report_v2.md       # 评测报告
+│   ├── baseline/          # v1.1 扁平 schema 的历史结果，用于对比
+│   └── migrate_v1_to_v2.py# schema 升级时的标注迁移映射（留档）
+├── experiments/           # 一次性实验脚本（prompt 分层、确定性验证）
+├── practice/              # 学习练习（字符串 / 文件 IO / 裸 HTTP / 流式）
+└── .env.example           # 环境变量模板
 ```
 
 ## License

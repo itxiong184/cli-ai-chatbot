@@ -22,3 +22,11 @@ __pycache__/
 # ===== 系统杂项 =====
 .DS_Store
 Thumbs.db
+
+# ===== 评测产出（可随时重跑，不入库）=====
+eval/out*.jsonl
+eval/failed*.jsonl
+
+# ===== 个人材料，绝不入库 =====
+我的简历.txt
+*.docx
