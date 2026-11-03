@@ -95,8 +95,68 @@ case("多段学历都应保留，不应报错", T21,
      expect_clean=True)
 
 
+# ============================================================
+# 第二部分：输入预检（preflight）—— 纯函数，同样必须钉死
+# ============================================================
+
+from preflight import preflight          # noqa: E402
+from extractor import check_skills       # noqa: E402
+
+T33 = "我是郑轻 2027 届的，网络工程专业，本科。"
+T08 = ("吴敏，电话 13611112222，邮箱 wumin@163.com。"
+       "做过 2 年测试工程师，熟悉 Python 自动化测试、Selenium、JMeter。目前在北京。")
+T_NO_PHONE = "张伟，2020 年毕业于河南大学，软件工程，本科。"
+
+# (说明, 文本, 断言函数, 期望)
+PRE_CASES = [
+    ("r33 校名缩写应进黑名单", T33,
+     lambda p: "郑轻" in p["banned_names"], True),
+    ("r33 应标记 NAME_ROLE_RISK", T33,
+     lambda p: "NAME_ROLE_RISK" in p["flags"], True),
+    ("有姓名锚点时不应报 NAME_ROLE_RISK",
+     "我叫李明，郑大 2023 届，电话 13800138000。",
+     lambda p: "NAME_ROLE_RISK" not in p["flags"], True),
+    ("带空格的手机号应被识别", T08.replace("13611112222", "136 1111 2222"),
+     lambda p: "NO_MOBILE_IN_TEXT" not in p["flags"], True),
+    ("没有手机号应标记 NO_MOBILE_IN_TEXT", T_NO_PHONE,
+     lambda p: "NO_MOBILE_IN_TEXT" in p["flags"], True),
+    ("第三方联系人应标记 THIRD_PARTY_CONTACT", T04,
+     lambda p: "THIRD_PARTY_CONTACT" in p["flags"], True),
+    ("裸姓名出现在行首应被当作锚点", T21,
+     lambda p: "周衡" in p["anchors"], True),
+    ("普通简历不应出现任何误报标记", T21,
+     lambda p: set(p["flags"]) <= {"NO_MOBILE_IN_TEXT"}, True),
+]
+
+# ============================================================
+# 第三部分：skills 粒度与姓名角色（走完整的 validate）
+# ============================================================
+
+case("skills 里出现学科/角色词应报错", T10,
+     blank(name="马丽", phone="13598765432", skills=["自动化测试"]),
+     expect_contains="角色词")
+case("skills 里出现拼接短语应报错", T08,
+     blank(name="吴敏", phone="13611112222", skills=["Python 自动化测试"]),
+     expect_contains="拼接短语")
+case("skills 编造应报错", T08,
+     blank(name="吴敏", phone="13611112222", skills=["Kubernetes"]),
+     expect_contains="找不到")
+case("skills 正常不应报错", T08,
+     blank(name="吴敏", phone="13611112222", city="北京", years_experience=2,
+           skills=["Python", "Selenium", "JMeter"]),
+     expect_clean=True)
+case("r33 把校名当姓名应报错", T33,
+     blank(name="郑轻"), expect_contains="学校简称")
+case("r33 姓名留空不应被误伤", T33,
+     blank(name=None,
+           education=[{"school": "郑轻", "major": "网络工程",
+                       "degree": "本科", "graduation_year": "2027"}]),
+     expect_clean=True)
+
+
 def main():
     ok = fail = 0
+
     for name, text, data, expect_contains, expect_clean in CASES:
         issues = validate(data, text)
         if expect_clean:
@@ -110,7 +170,16 @@ def main():
             print(f"         {detail}")
         ok, fail = (ok + 1, fail) if passed else (ok, fail + 1)
 
-    print(f"\n{ok} passed, {fail} failed  (共 {len(CASES)} 项)")
+    for name, text, check, expect in PRE_CASES:
+        got = check(preflight(text))
+        passed = got == expect
+        print(f"  [{'PASS' if passed else 'FAIL'}] {name}")
+        if not passed:
+            print(f"         期望 {expect}，实际 {got}；预检结果={preflight(text)}")
+        ok, fail = (ok + 1, fail) if passed else (ok, fail + 1)
+
+    total = len(CASES) + len(PRE_CASES)
+    print(f"\n{ok} passed, {fail} failed  (共 {total} 项)")
     return 0 if fail == 0 else 1
 
 

@@ -22,6 +22,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from extractor import extract, make_client
+from preflight import preflight
 from cost_tracker import CostMeter, fmt_yuan
 
 try:
@@ -29,8 +30,10 @@ try:
 except Exception:
     pass
 
-SCHEMA_VERSION = "v2.0"          # schema 改了就要升版本，否则新旧数据混在一起没法用
+SCHEMA_VERSION = "v2.1"          # schema 改了就要升版本，否则新旧数据混在一起没法用
 # v2.0：education / projects 改为数组（嵌套结构）。和 v1.1 的产出不可混读。
+# v2.1：skills 口径改为"具体技术名词"（剔除学科/方法/角色词）；新增输入预检与姓名角色校验。
+#       结构没变，但 gold 语义变了，所以同样要升版本 —— 版本号管的是"口径"，不只是"结构"。
 
 _write_lock = threading.Lock()
 
@@ -63,11 +66,16 @@ def load_done_ids(out_path, force=False):
     return {r["id"] for r in read_jsonl(out_path) if "id" in r}
 
 
-def run_one(item, client, meter):
+def run_one(item, client, meter, no_hints=False):
     """一次抽取。注意：异常不能往外抛，否则会吃掉整批。"""
     t0 = time.time()
+    pre = preflight(item["text"])
+    if no_hints:
+        # A/B 对照用：照常跑预检、照常记 flags，只是不把 hints 写进 prompt。
+        # 这样两组之间只差"那几句提示"，其他变量（schema、校验器、gold）完全相同。
+        pre = {**pre, "hints": []}
     try:
-        data, issues = extract(client, item["text"], meter=meter)
+        data, issues = extract(client, item["text"], meter=meter, pre=pre)
     except Exception as exc:
         return {"id": item["id"], "error": f"{type(exc).__name__}: {exc}"}
     return {
@@ -75,17 +83,19 @@ def run_one(item, client, meter):
         "schema_version": SCHEMA_VERSION,
         "data": data,
         "issues": issues,
+        "pre_flags": pre["flags"],       # 存下来，评测时可以按"有没有触发预检"分组看
         "elapsed": round(time.time() - t0, 2),
     }
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in", dest="inp", default="eval/samples_v2.jsonl")
-    ap.add_argument("--out", dest="out", default="eval/out_v2.jsonl")
-    ap.add_argument("--failed", dest="failed", default="eval/failed_v2.jsonl")
+    ap.add_argument("--in", dest="inp", default="eval/samples_v3.jsonl")
+    ap.add_argument("--out", dest="out", default="eval/out_v3.jsonl")
+    ap.add_argument("--failed", dest="failed", default="eval/failed_v3.jsonl")
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--no-hints", action="store_true", help="A/B 对照：不注入预检提示")
     args = ap.parse_args()
 
     if not os.getenv("API_KEY"):
@@ -110,7 +120,7 @@ def main():
     t_start = time.time()
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(run_one, it, client, meter): it for it in todo}
+        futures = {pool.submit(run_one, it, client, meter, args.no_hints): it for it in todo}
         for i, fut in enumerate(as_completed(futures), 1):
             row = fut.result()
             if "error" in row:

@@ -9,7 +9,7 @@ eval_resume.py — W3 D3：嵌套结构版的评测
 
 用法：
     python eval_resume.py                                   # 默认 v2
-    python eval_resume.py --out eval/out_v2.jsonl --gold eval/samples_v2.jsonl
+    python eval_resume.py --out eval/out_v3.jsonl --gold eval/samples_v3.jsonl
 """
 
 import os
@@ -148,9 +148,9 @@ def load_jsonl(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="eval/out_v2.jsonl")
-    ap.add_argument("--gold", default="eval/samples_v2.jsonl")
-    ap.add_argument("--report", default="eval/report_v2.md")
+    ap.add_argument("--out", default="eval/out_v3.jsonl")
+    ap.add_argument("--gold", default="eval/samples_v3.jsonl")
+    ap.add_argument("--report", default="eval/report_v3.md")
     args = ap.parse_args()
 
     if not os.path.exists(args.out):

@@ -23,6 +23,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 from cost_tracker import CostMeter, fmt_yuan
+from preflight import preflight
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -59,8 +60,12 @@ SCHEMA_DOC = """{
     }
   ],
 
-  "skills": string[],                // 全文出现的全部技术/工具关键词，含项目里提到的；
-                                     // 原文措辞照抄，不合并同类、不补全缩写；与 tech 允许重复
+  "skills": string[],                // 具体技术/工具/语言/框架/产品的专有名称，含项目里提到的；
+                                     // 粒度＝"能被单独检索的技术名词"：原文"Python 自动化测试"
+                                     // 只取 Python（"自动化测试"是领域词，不是工具）；
+                                     // 不收学科/方法/角色词：数据结构与算法、统计建模、
+                                     // 后端开发、接口联调、机器学习 都不算技能；
+                                     // 照抄原文措辞，不合并同类、不补全缩写；与 tech 允许重复
   "years_experience": number|null,   // 全职工作年限；仅实习/兼职不计入，应届生为 null
 
   "projects": [                      // 项目经历；没有明确项目名称的一律不收
@@ -82,10 +87,30 @@ SYSTEM_PROMPT = f"""你是一个简历信息抽取引擎。你的唯一任务是
 5. 手机号只保留数字；年份用四位数字字符串；技能拆成独立关键词。
 6. education 有几段写几段，不许只保留最高学历，也不许把两段合并成一条。
 7. projects 只收有明确名称的项目；实习期间做的项目也算；没有名称的不收，不要自己起名。
-8. skills 收全文中出现的所有技术/工具关键词，不限于"技能"那一段；和 tech 重复是允许的。
+8. skills 收全文中出现的所有技术关键词，不限于"技能"那一段；和 tech 重复是允许的。
+9. skills 只收具体技术名词（Python、MySQL、Spring Boot、Docker、LangChain）。
+   不收学科、方法、角色、流程词：数据结构与算法、统计建模、机器学习、后端开发、接口联调、自动化测试，都不算技能。
+   原文写"Python 自动化测试"，只取 Python，不要把整个短语抄进去，也不要拆成两个更细的词。
 
 schema:
 {SCHEMA_DOC}"""
+
+
+def build_system_prompt(pre=None):
+    """
+    把预检结论追加到 prompt 末尾，而不是插在开头。
+
+    这不是随手写的顺序 —— system prompt 是每次调用都要重发的固定前缀，
+    服务端按"从头开始逐字符匹配"做缓存。动态内容放开头，等于每条样本
+    的前缀都不一样，缓存全部失效，输入价直接从 1/50 变回全价（D5 的账）。
+    所以：固定内容在前，变动内容在后。
+    """
+    if not pre or not pre.get("hints"):
+        return SYSTEM_PROMPT
+    body = "\n".join(f"- {h}" for h in pre["hints"])
+    return (SYSTEM_PROMPT
+            + "\n\n本次输入的额外约束（由输入预检生成，与本 schema 同等优先）：\n"
+            + body)
 
 
 # ============================================================
@@ -155,14 +180,18 @@ def parse_json(text):
     return json.loads(text)
 
 
-def extract(client, text, meter=None, max_fix=1, verbose=False):
+def extract(client, text, meter=None, max_fix=1, verbose=False, pre=None):
     """
-    抽取主流程：调用 → 解析 → 校验 → （可选）带错误信息让模型修一次
+    抽取主流程：预检 → 调用 → 解析 → 校验 → （可选）带错误信息让模型修一次
 
     返回 (data, issues)；彻底失败返回 (None, [错误说明])
     """
+    # 输入侧预检：先看清楚这段文本有哪些坑，再决定要额外强调什么。
+    # 这一步不花钱，但能减少后面为"修错"付的钱。
+    pre = pre or preflight(text)
+
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": build_system_prompt(pre)},
         {"role": "user", "content": text},
     ]
 
@@ -186,7 +215,7 @@ def extract(client, text, meter=None, max_fix=1, verbose=False):
             return None, [f"JSON 解析失败：{exc}"]
 
         # ② 校验：解析成功不等于内容正确
-        issues = validate(data, text)
+        issues = validate(data, text, pre=pre)
         if not issues:
             return data, []
 
@@ -351,12 +380,89 @@ def check_projects(projects, text):
     return issues
 
 
-def validate(data, text):
+# 学科 / 方法 / 角色 / 流程词：看着像技能，其实不能拿去匹配 JD
+GENERIC_SKILLS = {
+    "数据结构", "数据结构与算法", "算法", "统计建模", "数学建模", "机器学习", "深度学习",
+    "数据分析", "自动化测试", "单元测试", "接口联调", "后端开发", "前端开发", "全栈开发",
+    "大模型接口", "编程", "开发", "测试", "运维", "接口", "数据库", "框架",
+}
+MAX_SKILL_LEN = 16
+
+
+def check_skills(skills, text):
+    """
+    skills 是列表，最容易出的不是"抽不到"，而是"粒度和类型不对"。
+    三种错法各有对策：
+      编造     → 原文回溯
+      粒度过粗 → 长度上限（"Python 自动化测试" 这类短语）
+      类型不对 → 泛化词黑名单（"数据结构与算法" 是学科，"后端开发" 是角色）
+    """
+    issues = []
+    if not isinstance(skills, list):
+        return ["skills 必须是数组"]
+
+    norm_text = _norm(text)
+    for raw in skills:
+        if not isinstance(raw, str) or not raw.strip():
+            issues.append(f"skills 中出现非字符串或空值：{raw!r}")
+            continue
+        s = raw.strip()
+        if len(s) > MAX_SKILL_LEN:
+            issues.append(f'skills 中 "{s}" 过长（{len(s)} 字），粒度应到单个技术名词')
+        if s in GENERIC_SKILLS:
+            issues.append(f'skills 中 "{s}" 是学科/方法/角色词，不是具体技术名词，应删除')
+            continue
+        # "Python 自动化测试" 这种是"技术名 + 领域词"的拼接，长度检查抓不到（才 12 字），
+        # 但它同样不能被当作一个技能去匹配 JD —— 只该留 Python。
+        for w in GENERIC_SKILLS:
+            if w != s and len(s) > len(w) and (s.endswith(w) or s.startswith(w)):
+                keep = s.replace(w, "").strip()
+                issues.append(f'skills 中 "{s}" 是技术名与领域词的拼接短语，应只保留 "{keep}"')
+                break
+        if _norm(s) not in norm_text:
+            issues.append(f'skills 中 "{s}" 在原文中找不到，疑似编造')
+    return issues
+
+
+def check_name_role(data, pre):
+    """
+    "郑轻" 被当成姓名（r33）—— 这类错误有两个独立证据来源：
+      ① 输入预检：这个词出现在"我是…的 / …届"结构里（学校语境）
+      ② 交叉验证：这个词是某条 education.school 的子串
+    两条任意命中就报。用结构性证据而不是关键词距离，是因为
+    "姓名字段"没有上下文窗口可言——名字在简历里通常独立出现。
+    """
+    issues = []
+    name = data.get("name")
+    if name in (None, ""):
+        return issues
+    name = str(name).strip()
+
+    banned = set(pre.get("banned_names") or []) if pre else set()
+    if name in banned:
+        issues.append(
+            f'name="{name}" 出现在「我是…的 / …届 / 毕业于…」这类学校语境里，'
+            f'它更像学校简称，不是姓名')
+        return issues
+
+    if len(name) <= 4:
+        for i, item in enumerate(data.get("education") or []):
+            school = (item or {}).get("school") or ""
+            if name and name in school:
+                issues.append(
+                    f'name="{name}" 是 education[{i}].school「{school}」的一部分，'
+                    f'疑似把学校名当成姓名')
+                break
+    return issues
+
+
+def validate(data, text, pre=None):
     """
     返回问题列表，空列表 = 通过。
     校验分四层：结构 → 格式 → 依据 → 归属
     """
     issues = []
+    pre = pre or preflight(text)
 
     # 第一层：结构
     if not isinstance(data, dict):
@@ -379,8 +485,7 @@ def validate(data, text):
     if email not in (None, "") and not EMAIL_RE.match(str(email)):
         issues.append(f'email 格式不合法："{email}"')
 
-    if not isinstance(data.get("skills"), list):
-        issues.append("skills 必须是数组")
+    issues += check_skills(data.get("skills"), text)
 
     # 第三层：依据 —— 抽取结果必须能在原文找到
     # 这是抽取任务最便宜的质检手段：不比对原文，你就只能相信模型
@@ -392,6 +497,7 @@ def validate(data, text):
 
     issues += check_education(data.get("education"), text)
     issues += check_projects(data.get("projects"), text)
+    issues += check_name_role(data, pre)
 
     # 第四层：归属 —— 值在原文里，但它属于谁？
     issues += check_attribution(data, text)
@@ -411,10 +517,14 @@ def _fmt(v):
     return str(v)
 
 
-def show(title, data, issues, elapsed=None):
+def show(title, data, issues, elapsed=None, pre=None):
     print("\n" + "=" * 62)
     print(f"  {title}")
     print("=" * 62)
+    if pre and pre.get("flags"):
+        print(f"  预检标记   : {', '.join(pre['flags'])}")
+        if pre.get("banned_names"):
+            print(f"  禁作姓名   : {'、'.join(pre['banned_names'])}")
     if data is None:
         print("  [失败] " + "；".join(issues))
         return
@@ -473,8 +583,9 @@ def main():
 
     for title, text in samples.items():
         t0 = time.time()
-        data, issues = extract(client, text, meter=meter, verbose=verbose)
-        show(title, data, issues, time.time() - t0)
+        pre = preflight(text)
+        data, issues = extract(client, text, meter=meter, verbose=verbose, pre=pre)
+        show(title, data, issues, time.time() - t0, pre=pre)
 
     meter.report()
     print("\n  下一步：把 data 存成 JSON、入库、或者喂给下游打分程序——这就是结构化的意义。")
